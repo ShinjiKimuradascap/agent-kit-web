@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+.next/
+.turbo/
+
+# Env
+.env
+.env.local
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Lock files (frontend) — keep package-lock committed for reproducibility
+# (node_modules/ already ignored above)

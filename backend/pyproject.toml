@@ -1,0 +1,24 @@
+[project]
+name = "agent-kit-web-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "sse-starlette>=2.0",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.0",
+    "psycopg2-binary>=2.9",
+    "python-dotenv>=1.0",
+]
+# NOTE: agent-kit is installed separately via `pip install -e ../../agent-kit`
+
+[project.optional-dependencies]
+dev = ["httpx", "pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
