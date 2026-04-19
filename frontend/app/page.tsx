@@ -69,6 +69,12 @@ export default function Page() {
   const [agents, setAgents] = useState<{ name: string; description: string }[]>([]);
   const [skills, setSkills] = useState<{ name: string; description: string }[]>([]);
   const [running, setRunning] = useState(false);
+  // Queued messages: typed while a run is active. Auto-drained when the
+  // current run finishes (`done` SSE), or individually removed via the
+  // cancel × on each card.
+  const [queue, setQueue] = useState<string[]>([]);
+  const queueRef = useRef<string[]>([]);
+  useEffect(() => { queueRef.current = queue; }, [queue]);
   const [thinking, setThinking] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -152,6 +158,9 @@ export default function Page() {
     scrollBottom();
   };
 
+  // Main send: fires one turn. Callers decide what to do if `running`:
+  //  - queueOrSend(): append to queue while running, send when idle
+  //  - interruptAndSend(): abort current run + send immediately
   const send = async (overrideText?: string) => {
     const text = overrideText ?? input;
     if (!text.trim() || running) return;
@@ -207,8 +216,48 @@ export default function Page() {
       setStatus("");
       abortRef.current = null;
       await loadSessions();
+      // Drain the queue: if the user stacked messages while running, send
+      // the next one now. Do this after setRunning(false) has been flushed.
+      setTimeout(() => {
+        const next = queueRef.current[0];
+        if (next) {
+          setQueue((q) => q.slice(1));
+          send(next);
+        }
+      }, 30);
     }
   };
+
+  // Type while running → this queues the message.
+  const queueOrSend = (text?: string) => {
+    const msg = (text ?? input).trim();
+    if (!msg) return;
+    if (running) {
+      setQueue((q) => [...q, msg]);
+      setInput("");
+    } else {
+      send(msg);
+    }
+  };
+
+  // ⌘+Enter / red button: abort current run, send this immediately.
+  const interruptAndSend = async (text?: string) => {
+    const msg = (text ?? input).trim();
+    if (!msg) return;
+    setInput("");
+    if (running && sessionId) {
+      try {
+        await fetch(`${apiBase()}/api/chat/${sessionId}`, { method: "DELETE" });
+      } catch {}
+      abortRef.current?.abort();
+      // Wait briefly for the running fetch to unwind; interval matches drain timer.
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    send(msg);
+  };
+
+  const removeFromQueue = (i: number) =>
+    setQueue((q) => q.filter((_, idx) => idx !== i));
 
   const handleSseFrame = (frame: string) => {
     const lines = frame.split("\n");
@@ -567,43 +616,81 @@ export default function Page() {
 
         <div className="border-t border-border bg-gradient-to-b from-transparent to-bg">
           <div className="max-w-3xl mx-auto px-6 py-4">
+            {/* Queued messages (shown while a run is active or queue non-empty) */}
+            {queue.length > 0 && (
+              <div className="mb-3 space-y-1.5">
+                {queue.map((msg, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-2 px-3 py-1.5 rounded-lg bg-surface/70 border border-border text-xs"
+                  >
+                    <span className="text-[10px] uppercase tracking-wider text-subtle mt-0.5">
+                      Queued {i + 1}
+                    </span>
+                    <span className="flex-1 min-w-0 truncate text-muted">{msg}</span>
+                    <button
+                      onClick={() => removeFromQueue(i)}
+                      aria-label="cancel queued"
+                      className="text-subtle hover:text-danger transition"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="relative bg-surface border border-border rounded-2xl shadow-soft focus-within:border-border-strong transition">
               <ImeTextarea
                 ref={textareaRef}
                 value={input}
                 onChange={setInput}
-                onSend={() => send()}
-                disabled={running}
+                onSend={() => queueOrSend()}
+                onInterruptSend={() => interruptAndSend()}
+                disabled={false}
               />
-              {/* Floating send / stop button inside the input */}
-              <div className="absolute right-2 bottom-2">
-                {running ? (
+              {/* Floating action buttons */}
+              <div className="absolute right-2 bottom-2 flex items-center gap-2">
+                {running && (
                   <button
                     onClick={cancel}
                     aria-label="停止"
+                    title="停止"
                     className="h-8 w-8 rounded-full bg-danger/90 hover:bg-danger text-white flex items-center justify-center transition"
                   >
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                       <rect x="2" y="2" width="8" height="8" rx="1" />
                     </svg>
                   </button>
-                ) : (
-                  <button
-                    onClick={() => send()}
-                    disabled={!input.trim()}
-                    aria-label="送信"
-                    className="h-8 w-8 rounded-full bg-accent text-accent-fg disabled:opacity-30 disabled:cursor-not-allowed enabled:hover:opacity-90 flex items-center justify-center transition"
-                  >
+                )}
+                <button
+                  onClick={() => queueOrSend()}
+                  disabled={!input.trim()}
+                  aria-label={running ? "キューに追加" : "送信"}
+                  title={running ? "キューに追加 (Enter)" : "送信 (Enter)"}
+                  className="h-8 w-8 rounded-full bg-accent text-accent-fg disabled:opacity-30 disabled:cursor-not-allowed enabled:hover:opacity-90 flex items-center justify-center transition"
+                >
+                  {running ? (
+                    <span className="text-[15px] leading-none">＋</span>
+                  ) : (
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                       <path d="M8 2 L8 14 M3 7 L8 2 L13 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
                     </svg>
-                  </button>
-                )}
+                  )}
+                </button>
               </div>
             </div>
-            <div className="mt-2 px-1 text-[11px] text-subtle flex items-center gap-3">
-              <span>Enter で送信 · Shift+Enter で改行</span>
+
+            <div className="mt-2 px-1 text-[11px] text-subtle flex items-center gap-3 flex-wrap">
+              {running ? (
+                <span>Enter で<b className="text-text">キュー</b>に追加 · ⌘+Enter で<b className="text-danger">割り込み送信</b> · Shift+Enter で改行</span>
+              ) : (
+                <span>Enter で送信 · Shift+Enter で改行</span>
+              )}
               {status && <span className="text-muted">{status}</span>}
+              {queue.length > 0 && !running && (
+                <span className="text-accent">↻ キュー {queue.length} 件を順次送信します</span>
+              )}
             </div>
           </div>
         </div>
@@ -617,11 +704,12 @@ type ImeTextareaProps = {
   value: string;
   onChange: (v: string) => void;
   onSend: () => void;
+  onInterruptSend?: () => void;   // ⌘/Ctrl + Enter
   disabled: boolean;
 };
 
 const ImeTextarea = forwardRef<HTMLTextAreaElement, ImeTextareaProps>(function ImeTextarea(
-  { value, onChange, onSend, disabled },
+  { value, onChange, onSend, onInterruptSend, disabled },
   ref,
 ) {
   const composing = useRef(false);
@@ -633,20 +721,27 @@ const ImeTextarea = forwardRef<HTMLTextAreaElement, ImeTextareaProps>(function I
       onCompositionStart={() => (composing.current = true)}
       onCompositionEnd={() => (composing.current = false)}
       onKeyDown={(e) => {
-        // Send on plain Enter ONLY when not composing Japanese IME
         if (e.key !== "Enter") return;
-        if (e.shiftKey) return; // Shift+Enter = newline
-        if (composing.current) return; // IME conversion in progress
-        if ((e.nativeEvent as any).isComposing) return; // Safari/Chromium guard
-        // Some IMEs fire keyDown with keyCode 229 during composition
+        // IME composition guard
+        if (composing.current) return;
+        if ((e.nativeEvent as any).isComposing) return;
         if ((e.nativeEvent as any).keyCode === 229) return;
+        // Shift+Enter → newline (default)
+        if (e.shiftKey) return;
+        // ⌘+Enter / Ctrl+Enter → interrupt current run and send
+        if ((e.metaKey || e.ctrlKey) && onInterruptSend) {
+          e.preventDefault();
+          onInterruptSend();
+          return;
+        }
+        // Plain Enter → queue or send (host decides)
         e.preventDefault();
         onSend();
       }}
       placeholder="メッセージを入力…"
       disabled={disabled}
       rows={2}
-      className="w-full bg-transparent pl-4 pr-12 pt-3 pb-3 resize-none text-sm outline-none placeholder:text-subtle disabled:opacity-60 min-h-[56px] max-h-[240px]"
+      className="w-full bg-transparent pl-4 pr-20 pt-3 pb-3 resize-none text-sm outline-none placeholder:text-subtle disabled:opacity-60 min-h-[56px] max-h-[240px]"
     />
   );
 });
