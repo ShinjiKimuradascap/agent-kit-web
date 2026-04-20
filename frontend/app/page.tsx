@@ -93,6 +93,25 @@ export default function Page() {
     if (r.ok) setSessions((await r.json()).sessions);
   }, []);
 
+  // Poll for running sessions so the sidebar can show a live indicator
+  // even when the user has switched away from an in-progress session.
+  const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/runs");
+        if (!r.ok) return;
+        const data = await r.json();
+        if (cancelled) return;
+        setRunningIds(new Set(data.running || []));
+      } catch {}
+    };
+    poll();
+    const h = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(h); };
+  }, []);
+
   useEffect(() => {
     (async () => {
       const [a, s] = await Promise.all([
@@ -120,10 +139,12 @@ export default function Page() {
     return () => window.removeEventListener("keydown", h);
   }, []);
 
-  const openSession = async (sid: string) => {
-    if (running) return;
+  // Reusable: load messages from session and convert to bubbles.
+  // Used by openSession and by the progress-poll fallback when re-attaching
+  // to a running session we switched away from.
+  const loadSessionBubbles = async (sid: string): Promise<Bubble[] | null> => {
     const r = await fetch(`/api/sessions/${sid}/messages`);
-    if (!r.ok) return;
+    if (!r.ok) return null;
     const data = await r.json();
     const bs: Bubble[] = [];
     for (const m of data.messages) {
@@ -153,17 +174,76 @@ export default function Page() {
         }
       }
     }
+    return bs;
+  };
+
+  const openSession = async (sid: string) => {
+    // Allow switching away from a running session. The backend run continues
+    // in place — we just drop the SSE stream on this side.
+    if (running && sessionId !== sid) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setRunning(false);
+      setStatus("");
+      setThinking(false);
+    }
+    const bs = await loadSessionBubbles(sid);
+    if (bs === null) return;
     setBubbles(bs);
     setSessionId(sid);
     scrollBottom();
   };
 
+  // Track previous runningIds so we can detect the "just stopped" transition.
+  const prevRunningRef = useRef<Set<string>>(new Set());
+
+  // Progress-poll: when the currently-displayed session is running on the
+  // backend (because we switched in from a different session), periodically
+  // re-fetch messages so the user sees new assistant replies / tool results
+  // as they arrive. Also does a one-shot final fetch when the run JUST
+  // completed, to catch the last messages written between the last poll and
+  // the runningIds update.
+  useEffect(() => {
+    if (!sessionId) return;
+    if (abortRef.current !== null) {
+      prevRunningRef.current = runningIds;
+      return;  // main SSE owns this turn
+    }
+
+    const isRunning = runningIds.has(sessionId);
+    const wasRunning = prevRunningRef.current.has(sessionId);
+    prevRunningRef.current = runningIds;
+
+    // Transition: was running, now stopped → one-shot final fetch
+    if (wasRunning && !isRunning) {
+      loadSessionBubbles(sessionId).then((bs) => {
+        if (bs) setBubbles((prev) => (bs.length !== prev.length ? bs : prev));
+      });
+      return;
+    }
+
+    if (!isRunning) return;
+
+    // Active polling while running
+    let cancelled = false;
+    const poll = async () => {
+      const bs = await loadSessionBubbles(sessionId);
+      if (cancelled || !bs) return;
+      setBubbles((prev) => (bs.length !== prev.length ? bs : prev));
+    };
+    // Kick one immediately, then every 2.5s
+    poll();
+    const h = setInterval(poll, 2500);
+    return () => { cancelled = true; clearInterval(h); };
+  }, [sessionId, runningIds]);
+
   // Main send: fires one turn. Callers decide what to do if `running`:
   //  - queueOrSend(): append to queue while running, send when idle
   //  - interruptAndSend(): abort current run + send immediately
-  const send = async (overrideText?: string) => {
+  const send = async (overrideText?: string, force = false) => {
     const text = overrideText ?? input;
-    if (!text.trim() || running) return;
+    if (!text.trim()) return;
+    if (running && !force) return;
     setInput("");
     setBubbles((b) => [...b, { kind: "text", role: "user", text }]);
     setRunning(true);
@@ -242,7 +322,12 @@ export default function Page() {
 
   // ⌘+Enter / red button: abort current run, send this immediately.
   const interruptAndSend = async (text?: string) => {
-    const msg = (text ?? input).trim();
+    let msg = (text ?? input).trim();
+    // If input is empty but queue has items, flush the head of the queue.
+    if (!msg && queueRef.current.length > 0) {
+      msg = queueRef.current[0];
+      setQueue((q) => q.slice(1));
+    }
     if (!msg) return;
     setInput("");
     if (running && sessionId) {
@@ -253,7 +338,7 @@ export default function Page() {
       // Wait briefly for the running fetch to unwind; interval matches drain timer.
       await new Promise((r) => setTimeout(r, 80));
     }
-    send(msg);
+    send(msg, true);
   };
 
   const removeFromQueue = (i: number) =>
@@ -571,7 +656,15 @@ export default function Page() {
                     sessionId === s.session_id ? "bg-elevated border-l-2 border-accent" : ""
                   }`}
                 >
-                  <div className="truncate text-text">{s.preview || "(新規)"}</div>
+                  <div className="flex items-center gap-1.5 truncate text-text">
+                    {runningIds.has(s.session_id) && (
+                      <span
+                        className="inline-block w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse flex-shrink-0"
+                        title="走行中"
+                      />
+                    )}
+                    <span className="truncate">{s.preview || "(新規)"}</span>
+                  </div>
                   <div className="text-subtle text-[10px] mt-0.5 truncate">
                     {s.agent} · {s.session_id.slice(0, 8)}
                   </div>

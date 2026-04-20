@@ -48,7 +48,19 @@ def agents():
 
 @app.get("/api/sessions")
 def sessions(limit: int = Query(50, ge=1, le=200)):
-    return {"sessions": list_sessions(limit=limit)}
+    from .stream import _active_runs
+    running_ids = set(_active_runs.keys())
+    lst = list_sessions(limit=limit)
+    for s in lst:
+        s["running"] = s.get("session_id") in running_ids
+    return {"sessions": lst}
+
+
+@app.get("/api/runs")
+def runs():
+    """Return set of currently-running session_ids (for sidebar indicator)."""
+    from .stream import _active_runs
+    return {"running": list(_active_runs.keys())}
 
 
 @app.get("/api/sessions/{session_id}/messages")
