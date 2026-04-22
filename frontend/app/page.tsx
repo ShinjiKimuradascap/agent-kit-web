@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -344,6 +344,17 @@ export default function Page() {
   const removeFromQueue = (i: number) =>
     setQueue((q) => q.filter((_, idx) => idx !== i));
 
+  // Stable callback for BubbleView memoization.
+  const handleEditArgs = useCallback((id: string, v: string) => {
+    setBubbles((prev) =>
+      prev.map((x) =>
+        x.kind === "approval" && x.approvalId === id
+          ? { ...x, editedArgs: v }
+          : x,
+      ),
+    );
+  }, []);
+
   const handleSseFrame = (frame: string) => {
     const lines = frame.split("\n");
     let event = "message";
@@ -682,23 +693,23 @@ export default function Page() {
             {bubbles.length === 0 && !thinking ? (
               <EmptyState agent={agent} onPick={(body) => send(body)} />
             ) : (
-              bubbles.map((b, i) => (
-                <BubbleView
-                  key={i}
-                  b={b}
-                  streaming={b.kind === "text" && !!b.streaming}
-                  onDecide={decideApproval}
-                  onEditArgs={(id, v) =>
-                    setBubbles((prev) =>
-                      prev.map((x) =>
-                        x.kind === "approval" && x.approvalId === id
-                          ? { ...x, editedArgs: v }
-                          : x,
-                      ),
-                    )
-                  }
-                />
-              ))
+              bubbles.map((b, i) => {
+                // Stable key: include index as a tie-breaker because providers
+                // occasionally reuse short tool_call_ids (e.g. "t1") across
+                // turns, and streamId can collide after session resume.
+                const k = b.kind === "tool" ? `tool:${b.id}:${i}`
+                  : b.kind === "approval" ? `appr:${b.approvalId}:${i}`
+                  : `text:${b.role}:${b.streamId ?? "s"}:${i}`;
+                return (
+                  <BubbleView
+                    key={k}
+                    b={b}
+                    streaming={b.kind === "text" && !!b.streaming}
+                    onDecide={decideApproval}
+                    onEditArgs={handleEditArgs}
+                  />
+                );
+              })
             )}
             {thinking &&
               !bubbles.some((b) => b.kind === "text" && b.streaming) && (
@@ -924,7 +935,7 @@ function ThinkingShimmer({ status }: { status?: string }) {
   );
 }
 
-function BubbleView({
+const BubbleView = memo(function BubbleView({
   b,
   streaming,
   onDecide,
@@ -965,7 +976,7 @@ function BubbleView({
       </div>
     </div>
   );
-}
+});
 
 function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
   // While the model is actively thinking, show the reasoning *prominently*
@@ -1014,7 +1025,7 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean 
   );
 }
 
-function ToolCard({ b }: { b: ToolBubble }) {
+const ToolCard = memo(function ToolCard({ b }: { b: ToolBubble }) {
   // Default: collapsed (one-line summary of name + args + elapsed).
   // User clicks to expand; preference remembered per card.
   const [userToggled, setUserToggled] = useState<boolean | null>(null);
@@ -1095,7 +1106,7 @@ function ToolCard({ b }: { b: ToolBubble }) {
       </div>
     </div>
   );
-}
+});
 
 function Spinner() {
   return (

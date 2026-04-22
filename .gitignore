@@ -24,3 +24,4 @@ node_modules/
 
 # Lock files (frontend) — keep package-lock committed for reproducibility
 # (node_modules/ already ignored above)
+frontend/tsconfig.tsbuildinfo

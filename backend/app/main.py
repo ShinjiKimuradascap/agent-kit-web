@@ -29,11 +29,30 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def _start_wakeup_daemon():
+    """Launch the autonomous wakeup poller once FastAPI is up."""
+    try:
+        from .wakeup_daemon import start_wakeup_daemon
+        start_wakeup_daemon()
+    except Exception as e:
+        logging.warning(f"failed to start wakeup daemon: {e}")
+
+
 class ChatRequest(BaseModel):
     message: str
     agent: Optional[str] = None
     session_id: Optional[str] = None
     resume: bool = False
+    # Slack gateway forwards image/file attachments as base64-encoded dicts:
+    #   {"type": "image", "name": "...", "mime_type": "image/png", "data": "<b64>"}
+    # Accepted here so run_stream can persist them to /tmp and inline the paths
+    # into the user's message (agent picks them up via analyze_image / read_file).
+    attachments: Optional[list[dict]] = None
+    # When set (Slack gateway only), isolates the tree knowledge per channel so
+    # confidential branches in one channel don't leak to another. Local CLI /
+    # Web UI callers leave this None and share the agent.md's tree_id.
+    channel_id: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -79,6 +98,8 @@ async def chat_stream(req: ChatRequest):
             agent_name=req.agent,
             session_id=req.session_id,
             resume=req.resume or bool(req.session_id),
+            attachments=req.attachments,
+            channel_id=req.channel_id,
         ),
         media_type="text/event-stream",
         headers={
