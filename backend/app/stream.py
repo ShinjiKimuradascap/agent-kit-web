@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import uuid
 from queue import Queue, Empty
@@ -27,6 +28,60 @@ logger = logging.getLogger(__name__)
 
 # session_id → { "interrupt": Event, "pending": {approval_id → ApprovalSlot} }
 _active_runs: dict[str, dict] = {}
+
+# One run per session at a time. Concurrent runs on one session (Slack user
+# nudges + wakeup nags) raced each other's persist/reload, mangling
+# tool_call↔result pairing — the model then saw promises without execution
+# traces and learned to keep promising. New messages now QUEUE behind the
+# in-flight run instead of stomping it.
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _lock_for(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        lk = _session_locks.get(session_id)
+        if lk is None:
+            lk = threading.Lock()
+            _session_locks[session_id] = lk
+        return lk
+
+
+def _acquire_session_slot(session_id: Optional[str],
+                          interrupt: threading.Event,
+                          takeover_sec: Optional[float] = None):
+    """Block until this session's slot is free. Returns (lock, acquired).
+
+    - fresh session (no id): nothing to serialize -> (None, True)
+    - interrupted while waiting: (lock, False) — caller should bail out
+    - after ``takeover_sec`` (default env AKW_SESSION_LOCK_TAKEOVER_SEC or
+      900s): the stale in-flight run is interrupted so the queue can drain.
+    """
+    if not session_id:
+        return None, True
+    if takeover_sec is None:
+        takeover_sec = float(os.environ.get(
+            "AKW_SESSION_LOCK_TAKEOVER_SEC", "900"))
+    lock = _lock_for(session_id)
+    if lock.acquire(blocking=False):
+        return lock, True
+    logger.info("session %s busy — queueing this message behind the "
+                "in-flight run", session_id)
+    waited = 0.0
+    took_over = False
+    while not lock.acquire(timeout=2.0):
+        waited += 2.0
+        if interrupt.is_set():
+            return lock, False
+        if waited >= takeover_sec and not took_over:
+            took_over = True
+            prev = _active_runs.get(session_id)
+            if prev:
+                logger.warning(
+                    "session %s busy for %.0fs — interrupting the stale "
+                    "in-flight run to drain the queue", session_id, waited)
+                prev["interrupt"].set()
+    return lock, True
 
 
 # LLM streaming is forwarded through agent-kit's native `on_text_chunk` /
@@ -162,6 +217,11 @@ async def run_stream(
     def worker():
         from agent_kit.approval import ApprovalDecision
 
+        slot_lock, slot_ok = _acquire_session_slot(session_id, interrupt)
+        if not slot_ok:
+            q.put(("interrupted", {}))
+            done.set()
+            return
         try:
             rt = build_runtime(agent_name=agent_name, session_id=session_id, resume=resume)
             runtime_holder["rt"] = rt
@@ -295,6 +355,11 @@ async def run_stream(
             sid = runtime_holder.get("session_id")
             if sid:
                 _active_runs.pop(sid, None)
+            if slot_lock is not None:
+                try:
+                    slot_lock.release()
+                except RuntimeError:
+                    pass
             done.set()
 
     t = threading.Thread(target=worker, daemon=True)
